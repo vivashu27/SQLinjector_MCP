@@ -1,0 +1,564 @@
+"""SQL Injection MCP Server - Main server implementation."""
+
+import asyncio
+from typing import Optional
+from mcp.server.fastmcp import FastMCP
+
+from sqli_mcp.models import (
+    DatabaseType, InjectionType, HttpMethod, WAFBypassTechnique,
+    AuthConfig, ProxyConfig, ScanConfig, ScanResult, VulnerabilityFinding
+)
+from sqli_mcp.scanner import Scanner, quick_scan
+from sqli_mcp.payloads import (
+    get_all_payloads, get_payloads_by_type, get_payloads_by_database,
+    load_custom_payloads, apply_waf_bypass, get_waf_bypass_variants,
+    PAYLOAD_CATEGORIES
+)
+from sqli_mcp.http_client import parse_url_params
+
+
+# Create MCP server
+mcp = FastMCP("SQLi-MCP")
+
+# Store scan results for later retrieval
+scan_results: dict[str, ScanResult] = {}
+custom_payloads_cache: dict[str, list] = {}
+
+
+# ============================================================================
+# TOOLS
+# ============================================================================
+
+@mcp.tool()
+async def scan_url(
+    target_url: str,
+    method: str = "GET",
+    post_data: Optional[str] = None,
+    injection_types: Optional[str] = None,
+    database_types: Optional[str] = None,
+    headers: Optional[str] = None,
+    cookies: Optional[str] = None,
+    bearer_token: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+    verify_ssl: bool = True,
+    waf_bypass: str = "none",
+    timeout: float = 10.0,
+    delay_threshold: float = 5.0
+) -> dict:
+    """
+    Scan a URL for SQL injection vulnerabilities in all detected parameters.
+    
+    Args:
+        target_url: Target URL with query parameters to scan (e.g., http://example.com/page?id=1)
+        method: HTTP method - GET or POST
+        post_data: POST data as key=value pairs separated by & (e.g., username=admin&password=test)
+        injection_types: Comma-separated injection types to test (error_based, time_based, boolean_based, union_based, blind)
+        database_types: Comma-separated database types to test (mysql, mssql, postgresql, oracle, sqlite, generic)
+        headers: Custom headers as key:value pairs separated by | (e.g., X-Custom:value|X-API-Key:abc123)
+        cookies: Cookies as key=value pairs separated by ; (e.g., session=abc123;token=xyz)
+        bearer_token: Bearer token for Authorization header
+        proxy_url: Proxy URL for Burp Suite or other proxies (e.g., http://127.0.0.1:8080)
+        verify_ssl: Verify SSL certificates (set to false when using proxy)
+        waf_bypass: WAF bypass technique (none, url_encode, double_url_encode, hex_encode, unicode, case_swap, comment_injection)
+        timeout: Request timeout in seconds
+        delay_threshold: Delay threshold in seconds for time-based detection
+    
+    Returns:
+        Scan results with vulnerabilities found
+    """
+    # Parse injection types
+    inj_types = list(InjectionType)
+    if injection_types:
+        inj_types = [InjectionType(t.strip()) for t in injection_types.split(",")]
+    
+    # Parse database types
+    db_types = list(DatabaseType)
+    if database_types:
+        db_types = [DatabaseType(t.strip()) for t in database_types.split(",")]
+    
+    # Parse headers
+    header_dict = {}
+    if headers:
+        for h in headers.split("|"):
+            if ":" in h:
+                k, v = h.split(":", 1)
+                header_dict[k.strip()] = v.strip()
+    
+    # Parse cookies
+    cookie_dict = {}
+    if cookies:
+        for c in cookies.split(";"):
+            if "=" in c:
+                k, v = c.split("=", 1)
+                cookie_dict[k.strip()] = v.strip()
+    
+    # Parse POST data
+    post_dict = None
+    if post_data:
+        post_dict = {}
+        for p in post_data.split("&"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                post_dict[k.strip()] = v.strip()
+    
+    # Build config
+    auth = AuthConfig(headers=header_dict, cookies=cookie_dict, bearer_token=bearer_token)
+    proxy = ProxyConfig(http_proxy=proxy_url, https_proxy=proxy_url, verify_ssl=verify_ssl) if proxy_url else None
+    
+    config = ScanConfig(
+        target_url=target_url,
+        method=HttpMethod(method.upper()),
+        post_data=post_dict,
+        injection_types=inj_types,
+        database_types=db_types,
+        auth=auth,
+        proxy=proxy,
+        waf_bypass=WAFBypassTechnique(waf_bypass),
+        timeout=timeout,
+        delay_threshold=delay_threshold
+    )
+    
+    scanner = Scanner(config)
+    result = await scanner.scan()
+    
+    # Cache result
+    scan_results[result.scan_id] = result
+    
+    return result.model_dump()
+
+
+@mcp.tool()
+async def scan_get_parameter(
+    target_url: str,
+    parameter: str,
+    injection_types: Optional[str] = None,
+    database_types: Optional[str] = None,
+    headers: Optional[str] = None,
+    cookies: Optional[str] = None,
+    bearer_token: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+    verify_ssl: bool = True,
+    waf_bypass: str = "none"
+) -> dict:
+    """
+    Test a specific GET parameter for SQL injection.
+    
+    Args:
+        target_url: Target URL (e.g., http://example.com/page?id=1&name=test)
+        parameter: Specific parameter name to test (e.g., id)
+        injection_types: Comma-separated injection types to test
+        database_types: Comma-separated database types to test  
+        headers: Custom headers as key:value pairs separated by |
+        cookies: Cookies as key=value pairs separated by ;
+        bearer_token: Bearer token for Authorization header
+        proxy_url: Proxy URL (e.g., http://127.0.0.1:8080 for Burp Suite)
+        verify_ssl: Verify SSL certificates
+        waf_bypass: WAF bypass technique
+    
+    Returns:
+        Scan results for the specified parameter
+    """
+    return await scan_url(
+        target_url=target_url,
+        method="GET",
+        injection_types=injection_types,
+        database_types=database_types,
+        headers=headers,
+        cookies=cookies,
+        bearer_token=bearer_token,
+        proxy_url=proxy_url,
+        verify_ssl=verify_ssl,
+        waf_bypass=waf_bypass
+    )
+
+
+@mcp.tool()
+async def scan_post_parameter(
+    target_url: str,
+    post_data: str,
+    parameter: str,
+    injection_types: Optional[str] = None,
+    database_types: Optional[str] = None,
+    headers: Optional[str] = None,
+    cookies: Optional[str] = None,
+    bearer_token: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+    verify_ssl: bool = True,
+    waf_bypass: str = "none"
+) -> dict:
+    """
+    Test a specific POST parameter for SQL injection.
+    
+    Args:
+        target_url: Target URL
+        post_data: POST body data as key=value pairs separated by & (e.g., username=admin&password=test)
+        parameter: Specific parameter name in POST data to test
+        injection_types: Comma-separated injection types to test
+        database_types: Comma-separated database types to test
+        headers: Custom headers as key:value pairs separated by |
+        cookies: Cookies as key=value pairs separated by ;
+        bearer_token: Bearer token for Authorization header
+        proxy_url: Proxy URL for Burp Suite or other proxies
+        verify_ssl: Verify SSL certificates
+        waf_bypass: WAF bypass technique
+    
+    Returns:
+        Scan results for the specified POST parameter
+    """
+    # Build config with specific parameter
+    inj_types = list(InjectionType)
+    if injection_types:
+        inj_types = [InjectionType(t.strip()) for t in injection_types.split(",")]
+    
+    db_types = list(DatabaseType)
+    if database_types:
+        db_types = [DatabaseType(t.strip()) for t in database_types.split(",")]
+    
+    header_dict = {}
+    if headers:
+        for h in headers.split("|"):
+            if ":" in h:
+                k, v = h.split(":", 1)
+                header_dict[k.strip()] = v.strip()
+    
+    cookie_dict = {}
+    if cookies:
+        for c in cookies.split(";"):
+            if "=" in c:
+                k, v = c.split("=", 1)
+                cookie_dict[k.strip()] = v.strip()
+    
+    post_dict = {}
+    for p in post_data.split("&"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            post_dict[k.strip()] = v.strip()
+    
+    auth = AuthConfig(headers=header_dict, cookies=cookie_dict, bearer_token=bearer_token)
+    proxy = ProxyConfig(http_proxy=proxy_url, https_proxy=proxy_url, verify_ssl=verify_ssl) if proxy_url else None
+    
+    config = ScanConfig(
+        target_url=target_url,
+        method=HttpMethod.POST,
+        parameter=parameter,
+        post_data=post_dict,
+        injection_types=inj_types,
+        database_types=db_types,
+        auth=auth,
+        proxy=proxy,
+        waf_bypass=WAFBypassTechnique(waf_bypass)
+    )
+    
+    scanner = Scanner(config)
+    result = await scanner.scan()
+    scan_results[result.scan_id] = result
+    
+    return result.model_dump()
+
+
+@mcp.tool()
+async def test_payload(
+    target_url: str,
+    payload: str,
+    parameter: str,
+    method: str = "GET",
+    post_data: Optional[str] = None,
+    headers: Optional[str] = None,
+    cookies: Optional[str] = None,
+    bearer_token: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+    verify_ssl: bool = True,
+    waf_bypass: str = "none"
+) -> dict:
+    """
+    Test a specific SQL injection payload against a target.
+    
+    Args:
+        target_url: Target URL
+        payload: SQL injection payload to test
+        parameter: Parameter to inject the payload into
+        method: HTTP method (GET or POST)
+        post_data: POST data if method is POST
+        headers: Custom headers as key:value pairs separated by |
+        cookies: Cookies as key=value pairs separated by ;
+        bearer_token: Bearer token for Authorization header
+        proxy_url: Proxy URL for Burp Suite
+        verify_ssl: Verify SSL certificates
+        waf_bypass: WAF bypass technique to apply to payload
+    
+    Returns:
+        Test result with response details
+    """
+    from sqli_mcp.http_client import HttpClient, inject_payload_in_url, inject_payload_in_data
+    import time
+    
+    # Parse headers/cookies
+    header_dict = {}
+    if headers:
+        for h in headers.split("|"):
+            if ":" in h:
+                k, v = h.split(":", 1)
+                header_dict[k.strip()] = v.strip()
+    
+    cookie_dict = {}
+    if cookies:
+        for c in cookies.split(";"):
+            if "=" in c:
+                k, v = c.split("=", 1)
+                cookie_dict[k.strip()] = v.strip()
+    
+    auth = AuthConfig(headers=header_dict, cookies=cookie_dict, bearer_token=bearer_token)
+    proxy = ProxyConfig(http_proxy=proxy_url, https_proxy=proxy_url, verify_ssl=verify_ssl) if proxy_url else None
+    
+    client = HttpClient(auth=auth, proxy=proxy)
+    
+    # Apply WAF bypass
+    encoded_payload = apply_waf_bypass(payload, WAFBypassTechnique(waf_bypass))
+    
+    try:
+        if method.upper() == "GET":
+            test_url = inject_payload_in_url(target_url, parameter, encoded_payload)
+            response, elapsed = await client.request_with_timing(test_url, HttpMethod.GET)
+        else:
+            post_dict = {}
+            if post_data:
+                for p in post_data.split("&"):
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        post_dict[k.strip()] = v.strip()
+            
+            test_data = inject_payload_in_data(post_dict, parameter, encoded_payload)
+            response, elapsed = await client.request_with_timing(
+                target_url, HttpMethod.POST, data=test_data
+            )
+        
+        return {
+            "success": True,
+            "status_code": response.status_code,
+            "response_time": round(elapsed, 3),
+            "response_length": len(response.text),
+            "payload_used": encoded_payload,
+            "original_payload": payload,
+            "waf_bypass_applied": waf_bypass,
+            "response_preview": response.text[:500] if len(response.text) > 500 else response.text
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "payload_used": encoded_payload
+        }
+
+
+@mcp.tool()
+def list_payloads(
+    category: Optional[str] = None,
+    database: Optional[str] = None,
+    limit: int = 20
+) -> dict:
+    """
+    List available SQL injection payloads.
+    
+    Args:
+        category: Filter by category (error_based, time_based, boolean_based, union_based, blind)
+        database: Filter by database type (mysql, mssql, postgresql, oracle, sqlite, generic)
+        limit: Maximum number of payloads to return
+    
+    Returns:
+        List of available payloads with descriptions
+    """
+    if category:
+        inj_type = InjectionType(category)
+        payloads = get_payloads_by_type(inj_type)
+    elif database:
+        db_type = DatabaseType(database)
+        payloads = get_payloads_by_database(db_type)
+    else:
+        payloads = get_all_payloads()
+    
+    # Apply database filter if both category and database specified
+    if category and database:
+        db_type = DatabaseType(database)
+        payloads = [p for p in payloads if p.database_type == db_type or p.database_type == DatabaseType.GENERIC]
+    
+    return {
+        "total_count": len(payloads),
+        "showing": min(limit, len(payloads)),
+        "categories": PAYLOAD_CATEGORIES,
+        "payloads": [
+            {
+                "value": p.value,
+                "type": p.injection_type.value,
+                "database": p.database_type.value,
+                "description": p.description
+            }
+            for p in payloads[:limit]
+        ]
+    }
+
+
+@mcp.tool()
+def load_custom_payloads_from_file(
+    file_path: str,
+    injection_type: str = "error_based",
+    database_type: str = "generic",
+    name: str = "custom"
+) -> dict:
+    """
+    Load custom SQL injection payloads from a file.
+    
+    Args:
+        file_path: Absolute path to the payload file (one payload per line)
+        injection_type: Injection type for loaded payloads
+        database_type: Database type for loaded payloads
+        name: Name to cache the payloads under for later use
+    
+    Returns:
+        Information about loaded payloads
+    """
+    try:
+        payloads = load_custom_payloads(
+            file_path,
+            InjectionType(injection_type),
+            DatabaseType(database_type)
+        )
+        custom_payloads_cache[name] = payloads
+        
+        return {
+            "success": True,
+            "name": name,
+            "count": len(payloads),
+            "preview": [p.value for p in payloads[:5]],
+            "message": f"Loaded {len(payloads)} custom payloads from {file_path}"
+        }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": f"File not found: {file_path}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+def get_waf_bypass_payloads(payload: str) -> dict:
+    """
+    Get all WAF bypass variants of a payload.
+    
+    Args:
+        payload: Original SQL injection payload
+    
+    Returns:
+        Dictionary of bypass techniques and their encoded payloads
+    """
+    variants = get_waf_bypass_variants(payload)
+    return {
+        "original": payload,
+        "techniques": list(variants.keys()),
+        "variants": variants
+    }
+
+
+@mcp.tool()
+def get_scan_result(scan_id: str) -> dict:
+    """
+    Retrieve a previous scan result by ID.
+    
+    Args:
+        scan_id: Scan ID from a previous scan
+    
+    Returns:
+        Scan result details
+    """
+    if scan_id in scan_results:
+        return scan_results[scan_id].model_dump()
+    return {"error": f"Scan ID {scan_id} not found"}
+
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+
+@mcp.resource("payloads://all")
+def get_all_payloads_resource() -> str:
+    """Get all available SQL injection payloads."""
+    payloads = get_all_payloads()
+    lines = [f"# SQL Injection Payloads ({len(payloads)} total)\n"]
+    
+    current_type = None
+    for p in payloads:
+        if p.injection_type != current_type:
+            current_type = p.injection_type
+            lines.append(f"\n## {current_type.value.upper()}\n")
+        lines.append(f"- [{p.database_type.value}] {p.value}")
+        if p.description:
+            lines.append(f"  # {p.description}")
+    
+    return "\n".join(lines)
+
+
+@mcp.resource("payloads://{category}")
+def get_payloads_by_category(category: str) -> str:
+    """Get payloads for a specific category."""
+    try:
+        inj_type = InjectionType(category)
+        payloads = get_payloads_by_type(inj_type)
+        
+        lines = [f"# {category.upper()} SQL Injection Payloads ({len(payloads)} total)\n"]
+        for p in payloads:
+            lines.append(f"[{p.database_type.value}] {p.value}")
+            if p.description:
+                lines.append(f"  # {p.description}")
+        
+        return "\n".join(lines)
+    except ValueError:
+        return f"Unknown category: {category}. Valid categories: {', '.join(PAYLOAD_CATEGORIES.keys())}"
+
+
+@mcp.resource("results://{scan_id}")
+def get_result_resource(scan_id: str) -> str:
+    """Get detailed scan results."""
+    if scan_id not in scan_results:
+        return f"Scan ID {scan_id} not found"
+    
+    result = scan_results[scan_id]
+    lines = [
+        f"# Scan Results: {scan_id}",
+        f"Target: {result.target_url}",
+        f"Parameters tested: {', '.join(result.parameters_tested)}",
+        f"Payloads tested: {result.payloads_tested}",
+        f"Duration: {result.duration_seconds}s",
+        f"\n## Vulnerabilities Found: {len(result.vulnerabilities)}\n"
+    ]
+    
+    for i, v in enumerate(result.vulnerabilities, 1):
+        lines.append(f"### Finding #{i}")
+        lines.append(f"- Parameter: {v.parameter}")
+        lines.append(f"- Type: {v.injection_type.value}")
+        lines.append(f"- Database: {v.database_type.value if v.database_type else 'Unknown'}")
+        lines.append(f"- Confidence: {v.confidence}")
+        lines.append(f"- Payload: `{v.payload_used}`")
+        lines.append(f"- Evidence: {v.evidence}\n")
+    
+    if result.errors:
+        lines.append("\n## Errors\n")
+        for e in result.errors:
+            lines.append(f"- {e}")
+    
+    return "\n".join(lines)
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Run the MCP server."""
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
