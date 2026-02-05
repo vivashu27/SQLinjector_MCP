@@ -74,6 +74,11 @@ Then connect to `http://localhost:8000/mcp`
 | `load_custom_payloads_from_file` | Load payloads from external file |
 | `get_waf_bypass_payloads` | Get WAF bypass variants of a payload |
 | `get_scan_result` | Retrieve previous scan results |
+| **Bulk Scanning** | |
+| `scan_urls_batch` | Scan multiple URLs (newline-separated, up to 500) |
+| `scan_urls_from_file` | Scan URLs from a file (one per line) |
+| `get_batch_result` | Retrieve batch scan results |
+| `get_vulnerable_urls` | Get only vulnerable URLs from batch |
 
 ## Examples
 
@@ -110,6 +115,32 @@ Use scan_url with:
 Use scan_url with:
 - target_url: "http://target.com/page?id=1"
 - waf_bypass: "comment_injection"
+```
+
+### Bulk URL Scanning
+
+**Scan multiple URLs from a list:**
+```
+Use scan_urls_batch with:
+- urls: "http://site1.com/page?id=1
+http://site2.com/search?q=test
+http://site3.com/user?uid=5"
+- concurrency: 10
+- waf_bypass: "url_encode"
+```
+
+**Scan URLs from a file:**
+```
+Use scan_urls_from_file with:
+- file_path: "C:/path/to/urls.txt"
+- concurrency: 5
+- proxy_url: "http://127.0.0.1:8080"
+```
+
+**Get vulnerable URLs only:**
+```
+Use get_vulnerable_urls with:
+- batch_id: "abc12345"
 ```
 
 ## Custom Payloads
