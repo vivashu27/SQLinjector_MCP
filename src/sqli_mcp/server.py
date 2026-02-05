@@ -481,6 +481,9 @@ def get_scan_result(scan_id: str) -> dict:
 # Store batch scan results
 batch_results: dict[str, dict] = {}
 
+# Store pending URLs for chunked scanning
+pending_scans: dict[str, dict] = {}
+
 
 @mcp.tool()
 async def scan_urls_batch(
@@ -494,53 +497,61 @@ async def scan_urls_batch(
     proxy_url: Optional[str] = None,
     verify_ssl: bool = True,
     waf_bypass: str = "none",
-    concurrency: int = 5,
-    timeout: float = 10.0
+    concurrency: int = 3,
+    timeout: float = 5.0,
+    quick_mode: bool = True,
+    max_urls_per_batch: int = 10
 ) -> dict:
     """
     Scan multiple URLs for SQL injection vulnerabilities in batch.
+    Use quick_mode=True (default) for faster scans that won't timeout.
     
     Args:
-        urls: Newline-separated list of URLs to scan (e.g., "http://site1.com/page?id=1\\nhttp://site2.com/page?id=2")
+        urls: Newline-separated list of URLs to scan
         method: HTTP method - GET or POST
-        injection_types: Comma-separated injection types to test (error_based, time_based, boolean_based, union_based, blind)
-        database_types: Comma-separated database types to test (mysql, mssql, postgresql, oracle, sqlite, generic)
+        injection_types: Comma-separated injection types (default: error_based only in quick_mode)
+        database_types: Comma-separated database types (default: generic,mysql in quick_mode)
         headers: Custom headers as key:value pairs separated by |
         cookies: Cookies as key=value pairs separated by ;
         bearer_token: Bearer token for Authorization header
         proxy_url: Proxy URL for Burp Suite or other proxies
         verify_ssl: Verify SSL certificates
         waf_bypass: WAF bypass technique
-        concurrency: Number of concurrent scans (1-20, default 5)
-        timeout: Request timeout in seconds per URL
+        concurrency: Number of concurrent scans (1-10, default 3)
+        timeout: Request timeout in seconds per URL (default 5)
+        quick_mode: Use quick scan with fewer payloads (default True, recommended for many URLs)
+        max_urls_per_batch: Max URLs to scan in one call (default 10, use continue_batch for more)
     
     Returns:
-        Batch scan results with summary and per-URL findings
+        Batch scan results. If more URLs remain, use continue_batch with the batch_id.
     """
     import uuid
     import time
     
     # Parse URLs
-    url_list = [u.strip() for u in urls.strip().split('\n') if u.strip()]
+    url_list = [u.strip() for u in urls.strip().split('\n') if u.strip() and u.strip().startswith('http')]
     
     if not url_list:
-        return {"error": "No valid URLs provided"}
+        return {"error": "No valid URLs provided. URLs must start with http:// or https://"}
     
-    if len(url_list) > 500:
-        return {"error": f"Too many URLs ({len(url_list)}). Maximum is 500 URLs per batch."}
-    
-    # Limit concurrency
-    concurrency = max(1, min(20, concurrency))
+    # Limit concurrency and batch size for stability
+    concurrency = max(1, min(10, concurrency))
+    max_urls_per_batch = max(1, min(25, max_urls_per_batch))
     
     batch_id = str(uuid.uuid4())[:8]
     start_time = time.time()
     
-    # Parse common config
-    inj_types = list(InjectionType)
+    # In quick_mode, use minimal payloads for speed
+    if quick_mode:
+        inj_types = [InjectionType.ERROR_BASED]
+        db_types = [DatabaseType.GENERIC, DatabaseType.MYSQL]
+    else:
+        inj_types = list(InjectionType)
+        db_types = list(DatabaseType)
+    
+    # Override with user-specified types if provided
     if injection_types:
         inj_types = [InjectionType(t.strip()) for t in injection_types.split(",")]
-    
-    db_types = list(DatabaseType)
     if database_types:
         db_types = [DatabaseType(t.strip()) for t in database_types.split(",")]
     
@@ -560,6 +571,30 @@ async def scan_urls_batch(
     
     auth = AuthConfig(headers=header_dict, cookies=cookie_dict, bearer_token=bearer_token)
     proxy = ProxyConfig(http_proxy=proxy_url, https_proxy=proxy_url, verify_ssl=verify_ssl) if proxy_url else None
+    
+    # Split into current batch and remaining
+    current_batch = url_list[:max_urls_per_batch]
+    remaining_urls = url_list[max_urls_per_batch:]
+    
+    # Store remaining for continuation
+    if remaining_urls:
+        pending_scans[batch_id] = {
+            "remaining_urls": remaining_urls,
+            "method": method,
+            "injection_types": injection_types,
+            "database_types": database_types,
+            "headers": headers,
+            "cookies": cookies,
+            "bearer_token": bearer_token,
+            "proxy_url": proxy_url,
+            "verify_ssl": verify_ssl,
+            "waf_bypass": waf_bypass,
+            "concurrency": concurrency,
+            "timeout": timeout,
+            "quick_mode": quick_mode,
+            "max_urls_per_batch": max_urls_per_batch,
+            "all_results": []
+        }
     
     # Semaphore for concurrency control
     semaphore = asyncio.Semaphore(concurrency)
@@ -586,43 +621,96 @@ async def scan_urls_batch(
                     "scan_id": result.scan_id,
                     "status": "completed",
                     "vulnerabilities_found": len(result.vulnerabilities),
-                    "parameters_tested": result.parameters_tested,
                     "vulnerable": len(result.vulnerabilities) > 0
                 }
+            except asyncio.TimeoutError:
+                return {"url": url, "status": "timeout", "vulnerable": False}
             except Exception as e:
-                return {
-                    "url": url,
-                    "status": "error",
-                    "error": str(e),
-                    "vulnerable": False
-                }
+                return {"url": url, "status": "error", "error": str(e)[:100], "vulnerable": False}
     
     # Run scans concurrently
-    tasks = [scan_single_url(url) for url in url_list]
+    tasks = [scan_single_url(url) for url in current_batch]
     results = await asyncio.gather(*tasks)
     
     duration = time.time() - start_time
     
     # Summary
-    total = len(results)
+    total_in_batch = len(results)
     completed = sum(1 for r in results if r["status"] == "completed")
-    errors = sum(1 for r in results if r["status"] == "error")
+    errors = sum(1 for r in results if r["status"] in ["error", "timeout"])
     vulnerable_count = sum(1 for r in results if r.get("vulnerable", False))
     
     batch_result = {
         "batch_id": batch_id,
-        "total_urls": total,
+        "urls_in_this_batch": total_in_batch,
+        "total_urls_submitted": len(url_list),
+        "remaining_urls": len(remaining_urls),
         "completed": completed,
         "errors": errors,
         "vulnerable_urls": vulnerable_count,
         "duration_seconds": round(duration, 2),
-        "concurrency": concurrency,
+        "quick_mode": quick_mode,
         "results": results,
-        "vulnerable_urls_list": [r["url"] for r in results if r.get("vulnerable", False)]
+        "vulnerable_urls_list": [r["url"] for r in results if r.get("vulnerable", False)],
+        "has_more": len(remaining_urls) > 0,
+        "continue_hint": f"Use continue_batch(batch_id='{batch_id}') to scan remaining {len(remaining_urls)} URLs" if remaining_urls else None
     }
     
     batch_results[batch_id] = batch_result
     return batch_result
+
+
+@mcp.tool()
+async def continue_batch(batch_id: str) -> dict:
+    """
+    Continue scanning remaining URLs from a previous batch.
+    Use this when scan_urls_batch returns has_more=True.
+    
+    Args:
+        batch_id: Batch ID from a previous scan_urls_batch call
+    
+    Returns:
+        Next batch of scan results
+    """
+    if batch_id not in pending_scans:
+        return {"error": f"No pending scans for batch {batch_id}. Batch may be complete or expired."}
+    
+    pending = pending_scans[batch_id]
+    remaining = pending["remaining_urls"]
+    
+    if not remaining:
+        del pending_scans[batch_id]
+        return {"message": "All URLs in this batch have been scanned", "batch_id": batch_id}
+    
+    # Build URL string for the next batch
+    urls_str = "\n".join(remaining)
+    
+    # Scan next batch
+    result = await scan_urls_batch(
+        urls=urls_str,
+        method=pending["method"],
+        injection_types=pending["injection_types"],
+        database_types=pending["database_types"],
+        headers=pending["headers"],
+        cookies=pending["cookies"],
+        bearer_token=pending["bearer_token"],
+        proxy_url=pending["proxy_url"],
+        verify_ssl=pending["verify_ssl"],
+        waf_bypass=pending["waf_bypass"],
+        concurrency=pending["concurrency"],
+        timeout=pending["timeout"],
+        quick_mode=pending["quick_mode"],
+        max_urls_per_batch=pending["max_urls_per_batch"]
+    )
+    
+    # Update the original batch_id reference
+    result["original_batch_id"] = batch_id
+    
+    # Clean up if complete
+    if not result.get("has_more", False) and batch_id in pending_scans:
+        del pending_scans[batch_id]
+    
+    return result
 
 
 @mcp.tool()
@@ -637,11 +725,14 @@ async def scan_urls_from_file(
     proxy_url: Optional[str] = None,
     verify_ssl: bool = True,
     waf_bypass: str = "none",
-    concurrency: int = 5,
-    timeout: float = 10.0
+    concurrency: int = 3,
+    timeout: float = 5.0,
+    quick_mode: bool = True,
+    max_urls_per_batch: int = 10
 ) -> dict:
     """
     Scan multiple URLs from a file for SQL injection vulnerabilities.
+    Returns results in chunks to avoid timeouts. Use continue_batch to get more results.
     
     Args:
         file_path: Absolute path to file containing URLs (one URL per line)
@@ -654,11 +745,13 @@ async def scan_urls_from_file(
         proxy_url: Proxy URL for Burp Suite or other proxies
         verify_ssl: Verify SSL certificates
         waf_bypass: WAF bypass technique
-        concurrency: Number of concurrent scans (1-20, default 5)
-        timeout: Request timeout in seconds per URL
+        concurrency: Number of concurrent scans (1-10, default 3)
+        timeout: Request timeout in seconds per URL (default 5)
+        quick_mode: Use quick scan with fewer payloads (default True)
+        max_urls_per_batch: Max URLs to scan in one call (default 10)
     
     Returns:
-        Batch scan results with summary and per-URL findings
+        Batch scan results. If more URLs remain, use continue_batch with the batch_id.
     """
     from pathlib import Path
     
@@ -672,8 +765,11 @@ async def scan_urls_from_file(
     except Exception as e:
         return {"error": f"Failed to read file: {str(e)}"}
     
+    # Count URLs for info
+    url_count = len([u for u in urls.strip().split('\n') if u.strip() and u.strip().startswith('http')])
+    
     # Delegate to batch scanner
-    return await scan_urls_batch(
+    result = await scan_urls_batch(
         urls=urls,
         method=method,
         injection_types=injection_types,
@@ -685,8 +781,14 @@ async def scan_urls_from_file(
         verify_ssl=verify_ssl,
         waf_bypass=waf_bypass,
         concurrency=concurrency,
-        timeout=timeout
+        timeout=timeout,
+        quick_mode=quick_mode,
+        max_urls_per_batch=max_urls_per_batch
     )
+    
+    result["source_file"] = file_path
+    result["total_urls_in_file"] = url_count
+    return result
 
 
 @mcp.tool()
